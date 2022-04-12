@@ -10,7 +10,7 @@ nice to meet you!
 then it can be expanded as follows:
 ```
 $ texpand -s name=Cathy -s me=Bob template.txt
-Hello  Cathy, I'm Bob,
+Hello Cathy, I'm Bob,
 nice to meet you!
 ```
 
