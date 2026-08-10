@@ -18,25 +18,14 @@ The template syntax is that of golang [text/template](https://pkg.go.dev/text/te
 
 ## Environment variables
 
-Environment variables can be used directly in the template with the `env` and
-`envOr` functions:
+Any environment variable can be used directly in the template with the `env` and
+`envOr` functions, with nothing to declare on the command line:
 ```
 $ echo 'Hi {{env "USER"}}, your editor is {{envOr "EDITOR" "vi"}}' | texpand
 Hi bob, your editor is vi
 ```
-`env` returns an empty string when the variable is not set, `envOr` returns its
-second argument instead.
-
-They can also be pulled into the dotmap. `-e` defines one key, either under the
-variable name or under an explicit key, and fails if the variable is not set:
-```
-$ echo 'Hi {{.USER}}, I am {{.me}}' | texpand -e USER -e me=LOGNAME
-```
-`-E` defines a key for every environment variable; keys defined with `-s` and
-`-e` take precedence:
-```
-$ echo 'Hi {{.USER}} from {{.HOME}}' | texpand -E
-```
+`env` returns an empty string when the variable is not set. `envOr` returns its
+second argument when the variable is unset or empty.
 
 ## The `stdin` function
 

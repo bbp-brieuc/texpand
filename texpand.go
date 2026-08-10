@@ -119,22 +119,6 @@ func main() {
 		dotMap[s[:i]] = s[i+1:]
 		return s, nil
 	})
-	newMultistringFlag("e", "Define a template expansion key from an environment variable.  Format: <name> or <key>=<name>.  It is an error if the variable is not set.", func(s string) (string, error) {
-		key, name := s, s
-		if i := strings.IndexByte(s, '='); i >= 0 {
-			key, name = s[:i], s[i+1:]
-		}
-		if key == "" || name == "" {
-			return "", fmt.Errorf("invalid environment variable definition %q - it must be <name> or <key>=<name>", s)
-		}
-		value, ok := os.LookupEnv(name)
-		if !ok {
-			return "", fmt.Errorf("the environment variable %q is not set", name)
-		}
-		dotMap[key] = value
-		return s, nil
-	})
-	importEnv := flag.Bool("E", false, "Define a template expansion key for every environment variable.  Keys defined with -s and -e take precedence.")
 	flag.CommandLine.Init("", flag.ContinueOnError)
 	flag.Usage = func() {}
 	if flag.CommandLine.Parse(os.Args[1:]) != nil {
@@ -159,29 +143,14 @@ all of stdin and returns it as a string:
 It can be called several times, always returning the same content, and it is an
 error to use it when the template itself is read from stdin.
 
-Environment variables are available through the "env" and "envOr" template
-functions, and can also be pulled into the dotmap with the -e and -E flags:
+Any environment variable is available through the "env" and "envOr" template
+functions, without having to declare it on the command line:
   $ echo 'home is {{env "HOME"}}, shell is {{envOr "SHELL" "none"}}' | %s
-  $ echo 'user is {{.user}}' | %s -e user=USER
-  $ echo 'user is {{.USER}}' | %s -E
-"env" returns an empty string for an unset variable, "envOr" returns its second
-argument, and -e fails when the variable is not set.
-`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
+"env" returns an empty string for an unset variable, while "envOr" returns its
+second argument when the variable is unset or empty.
+`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 		flag.PrintDefaults()
 		os.Exit(0)
-	}
-
-	if *importEnv {
-		for _, kv := range os.Environ() {
-			i := strings.IndexByte(kv, '=')
-			if i < 0 {
-				continue
-			}
-			// -s and -e have already filled the dotmap, and take precedence.
-			if _, ok := dotMap[kv[:i]]; !ok {
-				dotMap[kv[:i]] = kv[i+1:]
-			}
-		}
 	}
 
 	var t *template.Template
