@@ -6,9 +6,37 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"text/template"
 )
+
+// stdinFunc returns the "stdin" template function.  It drains stdin on the
+// first call and returns the same content on any subsequent call.  When the
+// template itself was read from stdin, stdin has already been consumed and the
+// function reports an error instead.
+func stdinFunc(templateReadFromStdin bool) func() (string, error) {
+	var (
+		once    sync.Once
+		content string
+		err     error
+	)
+	return func() (string, error) {
+		if templateReadFromStdin {
+			return "", fmt.Errorf("the stdin function is not available when the template itself is read from stdin")
+		}
+		once.Do(func() {
+			var b []byte
+			if b, err = ioutil.ReadAll(os.Stdin); err != nil {
+				err = fmt.Errorf("error when reading from stdin - %w", err)
+				return
+			}
+			content = string(b)
+		})
+		return content, err
+	}
+}
 
 type multistringFlag struct {
 	values []string
@@ -42,12 +70,12 @@ func die(code int, format string, a ...interface{}) {
 	os.Exit(code)
 }
 
-func parseReader(r io.Reader, description string) (*template.Template, error) {
+func parseReader(r io.Reader, description string, funcs template.FuncMap) (*template.Template, error) {
 	templateBytes, err := ioutil.ReadAll(r)
 	if err != nil {
 		return nil, fmt.Errorf("error when reading from %s - %w", description, err)
 	}
-	t, err := template.New(description).Parse(string(templateBytes))
+	t, err := template.New(description).Funcs(funcs).Parse(string(templateBytes))
 	if err != nil {
 		return nil, fmt.Errorf("error when parsing template read from %s - %w", description, err)
 	}
@@ -81,7 +109,14 @@ Example:
 
 The template is read from stdin, or from files passed as command line arguments.
 Its syntax is that of the golang text/template package, documented at https://pkg.go.dev/text/template and it's executed with the dot pointing to a map of string key/values, named the dotmap, defined using the -s flag.
-`, os.Args[0], os.Args[0], os.Args[0])
+
+When the template is read from files, the extra "stdin" template function reads
+all of stdin and returns it as a string:
+  $ echo world | %s -s greeting=Hello <(echo '{{.greeting}} {{stdin}}')
+  Hello world
+It can be called several times, always returning the same content, and it is an
+error to use it when the template itself is read from stdin.
+`, os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 		flag.PrintDefaults()
 		os.Exit(0)
 	}
@@ -89,9 +124,12 @@ Its syntax is that of the golang text/template package, documented at https://pk
 	var t *template.Template
 	var err error
 	if a := flag.Args(); len(a) > 0 {
-		t, err = template.ParseFiles(a...)
+		funcs := template.FuncMap{"stdin": stdinFunc(false)}
+		// The template returned by ParseFiles is named after the first file, so
+		// the root template must use that name for Execute to run it.
+		t, err = template.New(filepath.Base(a[0])).Funcs(funcs).ParseFiles(a...)
 	} else {
-		t, err = parseReader(os.Stdin, "stdin")
+		t, err = parseReader(os.Stdin, "stdin", template.FuncMap{"stdin": stdinFunc(true)})
 	}
 	if err != nil {
 		die(1, "%s", err)
