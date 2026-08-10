@@ -38,6 +38,32 @@ func stdinFunc(templateReadFromStdin bool) func() (string, error) {
 	}
 }
 
+// envFunc returns the "env" template function, which returns the value of an
+// environment variable, or an empty string when it is not set.
+func envFunc() func(string) string {
+	return os.Getenv
+}
+
+// envOrFunc returns the "envOr" template function, which returns the value of
+// an environment variable, or the given fallback when it is unset or empty.
+func envOrFunc() func(string, string) string {
+	return func(name, fallback string) string {
+		if v, ok := os.LookupEnv(name); ok && v != "" {
+			return v
+		}
+		return fallback
+	}
+}
+
+// templateFuncs builds the function map made available to templates.
+func templateFuncs(templateReadFromStdin bool) template.FuncMap {
+	return template.FuncMap{
+		"stdin": stdinFunc(templateReadFromStdin),
+		"env":   envFunc(),
+		"envOr": envOrFunc(),
+	}
+}
+
 type multistringFlag struct {
 	values []string
 	parse  func(string) (string, error)
@@ -93,6 +119,22 @@ func main() {
 		dotMap[s[:i]] = s[i+1:]
 		return s, nil
 	})
+	newMultistringFlag("e", "Define a template expansion key from an environment variable.  Format: <name> or <key>=<name>.  It is an error if the variable is not set.", func(s string) (string, error) {
+		key, name := s, s
+		if i := strings.IndexByte(s, '='); i >= 0 {
+			key, name = s[:i], s[i+1:]
+		}
+		if key == "" || name == "" {
+			return "", fmt.Errorf("invalid environment variable definition %q - it must be <name> or <key>=<name>", s)
+		}
+		value, ok := os.LookupEnv(name)
+		if !ok {
+			return "", fmt.Errorf("the environment variable %q is not set", name)
+		}
+		dotMap[key] = value
+		return s, nil
+	})
+	importEnv := flag.Bool("E", false, "Define a template expansion key for every environment variable.  Keys defined with -s and -e take precedence.")
 	flag.CommandLine.Init("", flag.ContinueOnError)
 	flag.Usage = func() {}
 	if flag.CommandLine.Parse(os.Args[1:]) != nil {
@@ -116,20 +158,41 @@ all of stdin and returns it as a string:
   Hello world
 It can be called several times, always returning the same content, and it is an
 error to use it when the template itself is read from stdin.
-`, os.Args[0], os.Args[0], os.Args[0], os.Args[0])
+
+Environment variables are available through the "env" and "envOr" template
+functions, and can also be pulled into the dotmap with the -e and -E flags:
+  $ echo 'home is {{env "HOME"}}, shell is {{envOr "SHELL" "none"}}' | %s
+  $ echo 'user is {{.user}}' | %s -e user=USER
+  $ echo 'user is {{.USER}}' | %s -E
+"env" returns an empty string for an unset variable, "envOr" returns its second
+argument, and -e fails when the variable is not set.
+`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 		flag.PrintDefaults()
 		os.Exit(0)
+	}
+
+	if *importEnv {
+		for _, kv := range os.Environ() {
+			i := strings.IndexByte(kv, '=')
+			if i < 0 {
+				continue
+			}
+			// -s and -e have already filled the dotmap, and take precedence.
+			if _, ok := dotMap[kv[:i]]; !ok {
+				dotMap[kv[:i]] = kv[i+1:]
+			}
+		}
 	}
 
 	var t *template.Template
 	var err error
 	if a := flag.Args(); len(a) > 0 {
-		funcs := template.FuncMap{"stdin": stdinFunc(false)}
+		funcs := templateFuncs(false)
 		// The template returned by ParseFiles is named after the first file, so
 		// the root template must use that name for Execute to run it.
 		t, err = template.New(filepath.Base(a[0])).Funcs(funcs).ParseFiles(a...)
 	} else {
-		t, err = parseReader(os.Stdin, "stdin", template.FuncMap{"stdin": stdinFunc(true)})
+		t, err = parseReader(os.Stdin, "stdin", templateFuncs(true))
 	}
 	if err != nil {
 		die(1, "%s", err)
