@@ -55,12 +55,19 @@ func envOrFunc() func(string, string) string {
 	}
 }
 
+// argsFunc returns the "args" template function, which returns the command line
+// arguments following the script file.
+func argsFunc(args []string) func() []string {
+	return func() []string { return args }
+}
+
 // templateFuncs builds the function map made available to templates.
-func templateFuncs(templateReadFromStdin bool) template.FuncMap {
+func templateFuncs(templateReadFromStdin bool, args []string) template.FuncMap {
 	return template.FuncMap{
 		"stdin": stdinFunc(templateReadFromStdin),
 		"env":   envFunc(),
 		"envOr": envOrFunc(),
+		"args":  argsFunc(args),
 	}
 }
 
@@ -108,8 +115,72 @@ func parseReader(r io.Reader, description string, funcs template.FuncMap) (*temp
 	return t, nil
 }
 
+// headerDelimiter is the line delimiting the header of a script file, both
+// before and after it.
+const headerDelimiter = "---"
+
+// parseDefinition reads a <key>=<value> definition from a header line.  The key
+// must be a letter or an underscore followed by letters, digits or underscores;
+// any other line is not a definition.  The value is the rest of the line, kept
+// verbatim.
+func parseDefinition(line string) (string, string, bool) {
+	i := strings.IndexByte(line, '=')
+	if i <= 0 {
+		return "", "", false
+	}
+	key := line[:i]
+	for j := 0; j < len(key); j++ {
+		switch c := key[j]; {
+		case c == '_', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case j > 0 && c >= '0' && c <= '9':
+		default:
+			return "", "", false
+		}
+	}
+	return key, line[i+1:], true
+}
+
+// splitScript splits the content of a script file into the values defined by
+// its header and its template section.  A leading shebang line is dropped, so
+// that the file can be run by the kernel through a "#!" line.  The header is
+// optional; when present it starts on the first line of the file which is
+// neither the shebang line nor a blank one, and both its first and last lines
+// contain exactly "---".  Header lines which are not <key>=<value> definitions
+// are ignored.
+func splitScript(content string) (map[string]string, string, error) {
+	values := make(map[string]string)
+	// SplitAfter keeps the line terminators, so that the template section can be
+	// rebuilt exactly as it was written.
+	lines := strings.SplitAfter(content, "\n")
+	trimmed := func(i int) string { return strings.TrimSuffix(lines[i], "\n") }
+	i := 0
+	if i < len(lines) && strings.HasPrefix(lines[i], "#!") {
+		i++
+	}
+	// A blank line is allowed between the shebang line and the header.
+	start := i
+	for i < len(lines) && strings.TrimSpace(lines[i]) == "" {
+		i++
+	}
+	if i >= len(lines) || trimmed(i) != headerDelimiter {
+		// There is no header, so the blank lines belong to the template.
+		i = start
+		return values, strings.Join(lines[i:], ""), nil
+	}
+	for i++; i < len(lines); i++ {
+		if trimmed(i) == headerDelimiter {
+			return values, strings.Join(lines[i+1:], ""), nil
+		}
+		if key, value, ok := parseDefinition(trimmed(i)); ok {
+			values[key] = value
+		}
+	}
+	return nil, "", fmt.Errorf("the header is not closed by a %q line", headerDelimiter)
+}
+
 func main() {
 	help := flag.Bool("h", false, "Print this help and exit.")
+	script := flag.Bool("f", false, "Read the template from a script file: its shebang line is dropped, its optional '---' delimited header defines values, and the remaining arguments are passed to the script instead of being read as templates.")
 	dotMap := make(map[string]string)
 	newMultistringFlag("s", "Define a string value associated to a template expansion key.  Format: <key>=<value>.", func(s string) (string, error) {
 		i := strings.IndexByte(s, '=')
@@ -148,20 +219,62 @@ functions, without having to declare it on the command line:
   $ echo 'home is {{env "HOME"}}, shell is {{envOr "SHELL" "none"}}' | %s
 "env" returns an empty string for an unset variable, while "envOr" returns its
 second argument when the variable is unset or empty.
-`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
+
+With the -f option, a single script file is read instead of templates.  Its
+first line is dropped when it is a "#!" line, so that the script can be run by
+the kernel, and it may start with a header delimited by two "---" lines, whose
+<key>=<value> lines define values for the expansion; any other header line is
+ignored.  The remaining command line arguments are not read as templates, they
+are returned by the "args" template function:
+  $ cat hello
+  #!/usr/local/bin/%s -f
+  ---
+  greeting=Hello
+  ---
+  {{.greeting}} {{index args 0}}
+  $ ./hello world
+  Hello world
+Values defined by the header are overridden by those given with the -s flag.
+
+`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
 		os.Exit(0)
 	}
 
 	var t *template.Template
 	var err error
-	if a := flag.Args(); len(a) > 0 {
-		funcs := templateFuncs(false)
+	a := flag.Args()
+	switch {
+	case *script:
+		if len(a) == 0 {
+			die(2, "the -f option requires a script file - run with -h for help")
+		}
+		var content []byte
+		if content, err = ioutil.ReadFile(a[0]); err != nil {
+			die(1, "error when reading %s - %s", a[0], err)
+		}
+		var values map[string]string
+		var body string
+		if values, body, err = splitScript(string(content)); err != nil {
+			die(1, "error when reading the script %s - %s", a[0], err)
+		}
+		// The values given on the command line take precedence over those
+		// defined by the script header.
+		for key, value := range dotMap {
+			values[key] = value
+		}
+		dotMap = values
+		t, err = template.New(filepath.Base(a[0])).Funcs(templateFuncs(false, a[1:])).Parse(body)
+		if err != nil {
+			err = fmt.Errorf("error when parsing the template read from %s - %w", a[0], err)
+		}
+	case len(a) > 0:
+		funcs := templateFuncs(false, nil)
 		// The template returned by ParseFiles is named after the first file, so
 		// the root template must use that name for Execute to run it.
 		t, err = template.New(filepath.Base(a[0])).Funcs(funcs).ParseFiles(a...)
-	} else {
-		t, err = parseReader(os.Stdin, "stdin", templateFuncs(true))
+	default:
+		t, err = parseReader(os.Stdin, "stdin", templateFuncs(true, nil))
 	}
 	if err != nil {
 		die(1, "%s", err)
