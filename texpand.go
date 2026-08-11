@@ -143,46 +143,46 @@ func parseDefinition(line string) (string, string, bool) {
 // splitScript splits the content of a script file into the values defined by
 // its header and its template.  A leading shebang line is dropped, so that the
 // file can be run by the kernel through a "#!" line.  The header is optional;
-// when present it starts on the first line of the file which is neither the
-// shebang line nor a blank one, and both its first and last lines contain
-// exactly "---".  Header lines which are not <key>=<value> definitions are
-// ignored.  The returned count is the number of lines preceding the template,
-// which the caller needs to map the line numbers reported by text/template,
-// relative to the template, back to the script file.
-func splitScript(content string) (map[string]string, string, int, error) {
-	values := make(map[string]string)
+// when present, both its first and last lines contain exactly "---", and
+// everything preceding it is ignored, whatever it contains, so that the file can
+// also be a script for another interpreter.  Header lines which are not
+// <key>=<value> definitions are ignored.  A file with no "---" line, or whose
+// first "---" line is not followed by another one, has no header: all of it,
+// save its shebang line, is the template.  The returned count is the number of
+// lines preceding the template, which the caller needs to map the line numbers
+// reported by text/template, relative to the template, back to the script file.
+func splitScript(content string) (map[string]string, string, int) {
 	// SplitAfter keeps the line terminators, so that the template section can be
 	// rebuilt exactly as it was written.
 	lines := strings.SplitAfter(content, "\n")
 	trimmed := func(i int) string { return strings.TrimSuffix(lines[i], "\n") }
-	i := 0
-	if i < len(lines) && strings.HasPrefix(lines[i], "#!") {
-		i++
+	start := 0
+	if len(lines) > 0 && strings.HasPrefix(lines[0], "#!") {
+		start = 1
 	}
-	// A blank line is allowed between the shebang line and the header.
-	start := i
-	for i < len(lines) && strings.TrimSpace(lines[i]) == "" {
-		i++
-	}
-	if i >= len(lines) || trimmed(i) != headerDelimiter {
-		// There is no header, so the blank lines belong to the template.
-		i = start
-		return values, strings.Join(lines[i:], ""), i, nil
-	}
-	for i++; i < len(lines); i++ {
-		if trimmed(i) == headerDelimiter {
-			return values, strings.Join(lines[i+1:], ""), i + 1, nil
+	for i := start; i < len(lines); i++ {
+		if trimmed(i) != headerDelimiter {
+			continue
 		}
-		if key, value, ok := parseDefinition(trimmed(i)); ok {
-			values[key] = value
+		values := make(map[string]string)
+		for j := i + 1; j < len(lines); j++ {
+			if trimmed(j) == headerDelimiter {
+				return values, strings.Join(lines[j+1:], ""), j + 1
+			}
+			if key, value, ok := parseDefinition(trimmed(j)); ok {
+				values[key] = value
+			}
 		}
+		// The header is never closed, so it isn't one: the values it seemed to
+		// define are dropped and the whole file is the template.
+		break
 	}
-	return nil, "", 0, fmt.Errorf("the header is not closed by a %q line", headerDelimiter)
+	return make(map[string]string), strings.Join(lines[start:], ""), start
 }
 
 func main() {
 	help := flag.Bool("h", false, "Print this help and exit.")
-	script := flag.Bool("f", false, "Read the template from a script file: its shebang line is dropped, its optional '---' delimited header defines values, and the remaining arguments are passed to the script instead of being read as templates.")
+	script := flag.String("f", "", "Read the template from the given script file: its shebang line is dropped, everything preceding its optional '---' delimited header is ignored, that header defines values, and the remaining arguments are passed to the script instead of being read as templates.")
 	dotMap := make(map[string]string)
 	newMultistringFlag("s", "Define a string value associated to a template expansion key.  Format: <key>=<value>.", func(s string) (string, error) {
 		i := strings.IndexByte(s, '=')
@@ -222,12 +222,13 @@ functions, without having to declare it on the command line:
 "env" returns an empty string for an unset variable, while "envOr" returns its
 second argument when the variable is unset or empty.
 
-With the -f option, a single script file is read instead of templates.  Its
-first line is dropped when it is a "#!" line, so that the script can be run by
-the kernel, and it may start with a header delimited by two "---" lines, whose
+The -f option names one script file, which is read instead of the templates.
+Its first line is dropped when it is a "#!" line, so that the script can be run
+by the kernel, and it may contain a header delimited by two "---" lines, whose
 <key>=<value> lines define values for the expansion; any other header line is
-ignored.  The remaining command line arguments are not read as templates, they
-are returned by the "args" template function:
+ignored, and so is everything preceding the header.  The remaining command line
+arguments are not read as templates, they are returned by the "args" template
+function:
   $ cat hello
   #!/usr/local/bin/%s -f
   ---
@@ -251,22 +252,14 @@ Values defined by the header are overridden by those given with the -s flag.
 	var note string
 	a := flag.Args()
 	switch {
-	case *script:
-		if len(a) == 0 {
-			die(2, "the -f option requires a script file - run with -h for help")
-		}
+	case *script != "":
 		var content []byte
-		if content, err = ioutil.ReadFile(a[0]); err != nil {
-			die(1, "error when reading %s - %s", a[0], err)
+		if content, err = ioutil.ReadFile(*script); err != nil {
+			die(1, "error when reading %s - %s", *script, err)
 		}
-		var values map[string]string
-		var body string
-		var skipped int
-		if values, body, skipped, err = splitScript(string(content)); err != nil {
-			die(1, "error when reading the script %s - %s", a[0], err)
-		}
+		values, body, skipped := splitScript(string(content))
 		if skipped > 0 {
-			note = fmt.Sprintf("\nnote: line N of the template is line N+%d of %s", skipped, a[0])
+			note = fmt.Sprintf("\nnote: line N of the template is line N+%d of %s", skipped, *script)
 		}
 		// The values given on the command line take precedence over those
 		// defined by the script header.
@@ -274,9 +267,9 @@ Values defined by the header are overridden by those given with the -s flag.
 			values[key] = value
 		}
 		dotMap = values
-		t, err = template.New(filepath.Base(a[0])).Funcs(templateFuncs(false, a[1:])).Parse(body)
+		t, err = template.New(filepath.Base(*script)).Funcs(templateFuncs(false, a)).Parse(body)
 		if err != nil {
-			err = fmt.Errorf("error when parsing the template read from %s - %w", a[0], err)
+			err = fmt.Errorf("error when parsing the template read from %s - %w", *script, err)
 		}
 	case len(a) > 0:
 		funcs := templateFuncs(false, nil)

@@ -47,7 +47,7 @@ already consumed by the template.
 
 ## Script files
 
-With the `-f` option, texpand reads a single script file rather than a list of
+The `-f <file>` option names one script file, which texpand reads instead of the
 templates, which lets it be used as an interpreter on a `#!` line:
 ```
 $ cat hello
@@ -63,13 +63,33 @@ $ ./hello world
 Hello world!
 ```
 
+Exactly one file is read as a script, the one given to `-f`; the option is not
+repeatable, and the other arguments are never read as templates.
+
 The file is made of three parts, and only the last one is mandatory:
 - a `#!` first line, which is dropped;
-- a header, optionally preceded by blank lines, delimited by two lines
-  containing exactly `---`, whose
+- a header delimited by two lines containing exactly `---`, whose
   `<key>=<value>` lines define values for the expansion, every other line being
   ignored;
 - the template itself.
+
+Everything preceding the header is ignored, whatever it contains, so the same
+file can be a script for another interpreter which calls texpand on itself:
+```
+#! /bin/sh
+
+texpand -f "$0" "$@" | some-other-command
+
+exit 0
+
+---
+greeting=Hello
+---
+{{.greeting}} {{index args 0}}!
+```
+
+A file with no `---` line, or whose first `---` line is not followed by another
+one, has no header: all of it, save its `#!` line, is the template.
 
 A key is a letter or an underscore followed by letters, digits or underscores;
 a value is the rest of the line, kept verbatim, so `foo = bar` defines nothing
