@@ -1,22 +1,114 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"text/template"
+	"time"
 )
+
+// recorder collects what an invocation consumed beyond its template files, so
+// that it can be replayed later: the environment variables actually expanded
+// and the content of stdin when it was read.  A nil recorder is valid and
+// records nothing, which is the case unless TEXPAND_LOG is set.
+type recorder struct {
+	path  string
+	env   map[string]string
+	unset map[string]bool
+	stdin *string
+}
+
+// newRecorder returns a recorder appending to the file named by the TEXPAND_LOG
+// environment variable, or nil when it is empty.
+func newRecorder() *recorder {
+	path := os.Getenv("TEXPAND_LOG")
+	if path == "" {
+		return nil
+	}
+	return &recorder{path: path, env: make(map[string]string), unset: make(map[string]bool)}
+}
+
+// recordEnv records one environment variable lookup made by the template.
+func (r *recorder) recordEnv(name, value string, set bool) {
+	if r == nil {
+		return
+	}
+	if set {
+		r.env[name] = value
+	} else {
+		r.unset[name] = true
+	}
+}
+
+// recordStdin records the content read from stdin, whether it was the template
+// itself or the value of the "stdin" template function.
+func (r *recorder) recordStdin(content string) {
+	if r == nil {
+		return
+	}
+	r.stdin = &content
+}
+
+// write appends the invocation record as one JSON line to the log file.  The
+// record holds everything the invocation consumed which is not in the template
+// files: argv, the working directory, the environment variables the template
+// expanded (unset ones listed apart, so a replay knows to unset them), stdin
+// when it was read, and the error when the invocation failed.
+func (r *recorder) write(failure error) error {
+	if r == nil {
+		return nil
+	}
+	entry := struct {
+		Time     string            `json:"time"`
+		Cwd      string            `json:"cwd,omitempty"`
+		Argv     []string          `json:"argv"`
+		Env      map[string]string `json:"env,omitempty"`
+		UnsetEnv []string          `json:"unset_env,omitempty"`
+		Stdin    *string           `json:"stdin,omitempty"`
+		Error    string            `json:"error,omitempty"`
+	}{
+		Time:  time.Now().Format(time.RFC3339),
+		Argv:  os.Args,
+		Env:   r.env,
+		Stdin: r.stdin,
+	}
+	// The directory matters to a replay because argv may hold relative paths;
+	// not knowing it is not worth failing the log.
+	entry.Cwd, _ = os.Getwd()
+	for name := range r.unset {
+		entry.UnsetEnv = append(entry.UnsetEnv, name)
+	}
+	sort.Strings(entry.UnsetEnv)
+	if failure != nil {
+		entry.Error = failure.Error()
+	}
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(append(line, '\n'))
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
 
 // stdinFunc returns the "stdin" template function.  It drains stdin on the
 // first call and returns the same content on any subsequent call.  When the
 // template itself was read from stdin, stdin has already been consumed and the
 // function reports an error instead.
-func stdinFunc(templateReadFromStdin bool) func() (string, error) {
+func stdinFunc(templateReadFromStdin bool, rec *recorder) func() (string, error) {
 	var (
 		once    sync.Once
 		content string
@@ -33,6 +125,7 @@ func stdinFunc(templateReadFromStdin bool) func() (string, error) {
 				return
 			}
 			content = string(b)
+			rec.recordStdin(content)
 		})
 		return content, err
 	}
@@ -40,16 +133,22 @@ func stdinFunc(templateReadFromStdin bool) func() (string, error) {
 
 // envFunc returns the "env" template function, which returns the value of an
 // environment variable, or an empty string when it is not set.
-func envFunc() func(string) string {
-	return os.Getenv
+func envFunc(rec *recorder) func(string) string {
+	return func(name string) string {
+		value, set := os.LookupEnv(name)
+		rec.recordEnv(name, value, set)
+		return value
+	}
 }
 
 // envOrFunc returns the "envOr" template function, which returns the value of
 // an environment variable, or the given fallback when it is unset or empty.
-func envOrFunc() func(string, string) string {
+func envOrFunc(rec *recorder) func(string, string) string {
 	return func(name, fallback string) string {
-		if v, ok := os.LookupEnv(name); ok && v != "" {
-			return v
+		value, set := os.LookupEnv(name)
+		rec.recordEnv(name, value, set)
+		if set && value != "" {
+			return value
 		}
 		return fallback
 	}
@@ -62,11 +161,11 @@ func argsFunc(args []string) func() []string {
 }
 
 // templateFuncs builds the function map made available to templates.
-func templateFuncs(templateReadFromStdin bool, args []string) template.FuncMap {
+func templateFuncs(templateReadFromStdin bool, args []string, rec *recorder) template.FuncMap {
 	return template.FuncMap{
-		"stdin": stdinFunc(templateReadFromStdin),
-		"env":   envFunc(),
-		"envOr": envOrFunc(),
+		"stdin": stdinFunc(templateReadFromStdin, rec),
+		"env":   envFunc(rec),
+		"envOr": envOrFunc(rec),
 		"args":  argsFunc(args),
 	}
 }
@@ -101,18 +200,6 @@ func (m *multistringFlag) Set(value string) error {
 func die(code int, format string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, format+"\n", a...)
 	os.Exit(code)
-}
-
-func parseReader(r io.Reader, description string, funcs template.FuncMap) (*template.Template, error) {
-	templateBytes, err := ioutil.ReadAll(r)
-	if err != nil {
-		return nil, fmt.Errorf("error when reading from %s - %w", description, err)
-	}
-	t, err := template.New(description).Funcs(funcs).Parse(string(templateBytes))
-	if err != nil {
-		return nil, fmt.Errorf("error when parsing template read from %s - %w", description, err)
-	}
-	return t, nil
 }
 
 // headerDelimiter is the line delimiting the header of a script file, both
@@ -239,11 +326,19 @@ function:
   Hello world
 Values defined by the header are overridden by those given with the -s flag.
 
+When the TEXPAND_LOG environment variable is not empty, it names a file where
+each invocation appends one JSON line recording what it consumed beyond the
+template files, so that anyone holding those files can reproduce the output:
+argv, the working directory, the environment variables the template actually
+expanded (the unset ones listed apart), stdin when it was read, and the error
+when the invocation failed.
+
 `, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
 		os.Exit(0)
 	}
 
+	rec := newRecorder()
 	var t *template.Template
 	var err error
 	// text/template reports line numbers relative to what it parsed, which for a
@@ -267,22 +362,33 @@ Values defined by the header are overridden by those given with the -s flag.
 			values[key] = value
 		}
 		dotMap = values
-		t, err = template.New(filepath.Base(*script)).Funcs(templateFuncs(false, a)).Parse(body)
+		t, err = template.New(filepath.Base(*script)).Funcs(templateFuncs(false, a, rec)).Parse(body)
 		if err != nil {
 			err = fmt.Errorf("error when parsing the template read from %s - %w", *script, err)
 		}
 	case len(a) > 0:
-		funcs := templateFuncs(false, nil)
+		funcs := templateFuncs(false, nil, rec)
 		// The template returned by ParseFiles is named after the first file, so
 		// the root template must use that name for Execute to run it.
 		t, err = template.New(filepath.Base(a[0])).Funcs(funcs).ParseFiles(a...)
 	default:
-		t, err = parseReader(os.Stdin, "stdin", templateFuncs(true, nil))
+		var b []byte
+		if b, err = ioutil.ReadAll(os.Stdin); err != nil {
+			err = fmt.Errorf("error when reading from stdin - %w", err)
+			break
+		}
+		rec.recordStdin(string(b))
+		if t, err = template.New("stdin").Funcs(templateFuncs(true, nil, rec)).Parse(string(b)); err != nil {
+			err = fmt.Errorf("error when parsing template read from stdin - %w", err)
+		}
+	}
+	if err == nil {
+		err = t.Execute(os.Stdout, dotMap)
+	}
+	if werr := rec.write(err); werr != nil {
+		fmt.Fprintf(os.Stderr, "warning: error when writing the invocation log to %s - %s\n", rec.path, werr)
 	}
 	if err != nil {
-		die(1, "%s%s", err, note)
-	}
-	if err = t.Execute(os.Stdout, dotMap); err != nil {
 		die(1, "%s%s", err, note)
 	}
 }

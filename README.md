@@ -100,6 +100,33 @@ The arguments following the script file are not read as templates: they are
 passed to the script, which reads them with the `args` function, either by
 index as above or with `{{range args}}`.
 
+## Invocation logging
+
+When the `TEXPAND_LOG` environment variable is not empty, it names a file where
+each invocation appends one JSON line recording everything it consumed beyond
+the template files, so that anyone holding those files can reproduce the
+output:
+```
+$ echo world | TEXPAND_LOG=texpand.log texpand -s greeting=Hello template.txt
+Hello world
+$ cat texpand.log
+{"time":"2026-08-22T12:00:00+02:00","cwd":"/home/bob","argv":["texpand","-s","greeting=Hello","template.txt"],"stdin":"world\n"}
+```
+
+The record holds:
+- `argv` and `cwd`, the working directory, since `argv` may name files through
+  relative paths;
+- `env`, the environment variables the template actually expanded with `env` or
+  `envOr` — only those, not the whole environment — and `unset_env`, the names
+  it looked up but which were not set, so that a replay knows to unset them;
+- `stdin`, when it was read, be it as the template itself or by the `stdin`
+  function;
+- `error`, when the invocation failed, and `time`, when it ran.
+
+The file is opened in append mode, so several invocations, even concurrent
+ones, can share it. A failure to write the log is only a warning: the
+expansion itself is not affected.
+
 Note that `#!/usr/bin/env texpand -f` does not work on Linux, where the kernel
 passes everything following the interpreter path as a single argument: use the
 absolute path of texpand, as above, or `#!/usr/bin/env -S texpand -f` on the
